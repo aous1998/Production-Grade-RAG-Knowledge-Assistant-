@@ -16,13 +16,23 @@ _web_search = None
 def llm():
     global _llm
     if _llm is None:
-        if not settings.openai_api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing")
-        _llm = ChatOpenAI(
-            model=settings.openai_model,
-            temperature=0,
-            api_key=settings.openai_api_key,
-        )
+        if settings.llm_provider == "groq":
+            if not settings.groq_api_key:
+                raise RuntimeError("GROQ_API_KEY is missing")
+            from langchain_groq import ChatGroq
+            _llm = ChatGroq(
+                model=settings.groq_model,
+                temperature=0,
+                api_key=settings.groq_api_key,
+            )
+        else:
+            if not settings.openai_api_key:
+                raise RuntimeError("OPENAI_API_KEY is missing")
+            _llm = ChatOpenAI(
+                model=settings.openai_model,
+                temperature=0,
+                api_key=settings.openai_api_key,
+            )
     return _llm
 
 def web_search_tool():

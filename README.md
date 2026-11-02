@@ -286,45 +286,36 @@ pip install -r requirements.txt
 Create a `.env` file in the project root directory with the following variables:
 
 ```env
-# LLM API Keys
+# Free setup (default): Groq LLM + local HuggingFace embeddings
 GROQ_API_KEY=your_groq_api_key_here
-OPENAI_API_KEY=your_openai_api_key_here
-
-# External Search
-TAVILY_API_KEY=your_tavily_api_key_here
-
-# Vector Database (Pinecone)
-PINECONE_API_KEY=your_pinecone_api_key_here
-PINECONE_INDEX_NAME=fde-it-support-rag
-PINECONE_NAMESPACE=company-it-kb
-
-# LLM Models
 GROQ_MODEL=openai/gpt-oss-20b
-OPENAI_MODEL=gpt-4o-mini
-EMBEDDING_MODEL=text-embedding-3-small
 
-# Security
+# Web search and vector database
+TAVILY_API_KEY=your_tavily_api_key_here
+PINECONE_API_KEY=your_pinecone_api_key_here
+
+# Protects document upload
 ADMIN_API_KEY=change-me-in-production
-
-# Application Settings
-APP_ENV=development
 ```
+
+To use OpenAI instead, add `LLM_PROVIDER=openai`, `EMBEDDING_PROVIDER=openai`, `EMBEDDING_MODEL=text-embedding-3-small` and `OPENAI_API_KEY`.
 
 #### Environment Variable Reference
 
-| Variable | Description | Example | Required |
-|---|---|---|---|
-| `GROQ_API_KEY` | API key for Groq LLM (routing, grading, generation) | `gsk_...` | ✅ Yes |
-| `OPENAI_API_KEY` | API key for OpenAI (embeddings and fallback LLM) | `sk-...` | ✅ Yes |
-| `TAVILY_API_KEY` | API key for Tavily web search | `tvly-...` | ✅ Yes |
-| `PINECONE_API_KEY` | API key for Pinecone vector database | `pckey-...` | ✅ Yes |
-| `PINECONE_INDEX_NAME` | Pinecone index name | `fde-it-support-rag` | ⚠️ Optional (default: `fde-it-support-rag`) |
-| `PINECONE_NAMESPACE` | Pinecone namespace for document isolation | `company-it-kb` | ⚠️ Optional (default: `company-it-kb`) |
-| `GROQ_MODEL` | Groq model identifier | `openai/gpt-oss-20b` | ⚠️ Optional (default: `openai/gpt-oss-20b`) |
-| `OPENAI_MODEL` | OpenAI model identifier | `gpt-4o-mini` | ⚠️ Optional (default: `gpt-4o-mini`) |
-| `EMBEDDING_MODEL` | Embedding model for vectorization | `text-embedding-3-small` | ⚠️ Optional (default: `text-embedding-3-small`) |
-| `ADMIN_API_KEY` | Secret key for admin endpoints (document ingestion) | `your-secure-key` | ⚠️ Optional (default: `change-me`) |
-| `APP_ENV` | Application environment | `development` or `production` | ⚠️ Optional (default: `development`) |
+| Variable | Description | Default |
+|---|---|---|
+| `GROQ_API_KEY` | Groq key for routing, grading, rewriting and answers | required with Groq |
+| `GROQ_MODEL` | Groq model | `openai/gpt-oss-20b` |
+| `TAVILY_API_KEY` | Tavily web search | required |
+| `PINECONE_API_KEY` | Pinecone vector database | required |
+| `ADMIN_API_KEY` | Key for the document upload endpoint | `change-me` |
+| `LLM_PROVIDER` | `groq` or `openai` | `groq` |
+| `EMBEDDING_PROVIDER` | `huggingface` (local, free) or `openai` | `huggingface` |
+| `EMBEDDING_MODEL` | Embedding model | `sentence-transformers/all-MiniLM-L6-v2` |
+| `OPENAI_API_KEY` / `OPENAI_MODEL` | Only when using OpenAI | `gpt-4o-mini` |
+| `PINECONE_INDEX_NAME` / `PINECONE_NAMESPACE` | Pinecone location | `fde-it-support-rag` / `company-it-kb` |
+
+If you switch embedding models, the Pinecone index is recreated automatically; run `python ingest_sample_kb.py` again.
 
 **⚠️ Important Security Notes:**
 
@@ -362,13 +353,13 @@ python run.py
 Open:
 
 ```text
-http://127.0.0.1:8000
+http://127.0.0.1:8080
 ```
 
 FastAPI API docs:
 
 ```text
-http://127.0.0.1:8000/docs
+http://127.0.0.1:8080/docs
 ```
 
 ---

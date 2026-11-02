@@ -16,6 +16,7 @@ EMBEDDING_DIMENSIONS = {
     "text-embedding-3-large": 3072,
     "text-embedding-ada-002": 1536,
     "all-minilm-l6-v2": 384,
+    "sentence-transformers/all-minilm-l6-v2": 384,
 }
 
 
@@ -47,12 +48,16 @@ def get_embedding_dimension(model_name: str | None = None) -> int:
 def get_embeddings():
     global _embeddings
     if _embeddings is None:
-        if not settings.openai_api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing")
-        _embeddings = OpenAIEmbeddings(
-            model=settings.embedding_model,
-            api_key=settings.openai_api_key,
-        )
+        if settings.embedding_provider == "huggingface":
+            from langchain_huggingface import HuggingFaceEmbeddings
+            _embeddings = HuggingFaceEmbeddings(model_name=settings.embedding_model)
+        else:
+            if not settings.openai_api_key:
+                raise RuntimeError("OPENAI_API_KEY is missing")
+            _embeddings = OpenAIEmbeddings(
+                model=settings.embedding_model,
+                api_key=settings.openai_api_key,
+            )
     return _embeddings
 
 
