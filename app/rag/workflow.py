@@ -1,3 +1,22 @@
+# =============================================================================
+# app/rag/workflow.py: the Agentic RAG brain (built with LangGraph)
+# -----------------------------------------------------------------------------
+# Plain RAG always does: question -> retrieve -> generate.
+# This agent DECIDES what to do next at every step:
+#
+#   question
+#     -> route_question ........ IT question? (no -> direct_answer)
+#     -> retrieve_kb ........... search company docs in Pinecone
+#     -> grade_kb .............. good enough? (yes -> generate_from_kb)
+#     -> search_web ............ fallback: Tavily web search
+#     -> grade_web ............. good enough? (yes -> generate_from_web)
+#     -> rewrite_query ......... retry left? rewrite and go back to retrieve_kb
+#     -> insufficient .......... no retries left: refuse politely
+#
+# Every node is a plain Python function: it receives the shared AgentState
+# (see state.py) and returns only the fields it changed. Each node also
+# appends a line to `trace`, which the UI shows as the "decision path".
+# =============================================================================
 import logging
 from typing import Literal
 from langchain_openai import ChatOpenAI
@@ -10,10 +29,16 @@ from app.rag.vectorstore import get_retriever
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+# Clients are created on first use and reused for every later request.
 _llm = None
 _web_search = None
 
 def llm():
+    """Return the chat model (Groq by default, OpenAI if LLM_PROVIDER=openai).
+
+    temperature=0 makes answers as deterministic as possible, which matters
+    for the router and graders that must return consistent decisions.
+    """
     global _llm
     if _llm is None:
         if settings.llm_provider == "groq":
@@ -36,6 +61,7 @@ def llm():
     return _llm
 
 def web_search_tool():
+    """Return the Tavily web search client (top 5 results plus a short summary answer)."""
     global _web_search
     if _web_search is None:
         if not settings.tavily_api_key:
@@ -50,8 +76,14 @@ def web_search_tool():
     return _web_search
 
 def add_trace(state: AgentState, message: str):
+    # Return a NEW list (old trace + message) rather than mutating the old one.
     return [*state.get("trace", []), message]
 
+# ---------------------------------------------------------------------------
+# Step 1: ROUTER. Decide whether the question needs the knowledge base at all.
+# with_structured_output(..., method="json_mode") makes the LLM reply with JSON
+# that is parsed into a RouteDecision object, e.g. RouteDecision(route="kb").
+# ---------------------------------------------------------------------------
 def route_question(state: AgentState):
     router = llm().with_structured_output(RouteDecision, method="json_mode")
     decision = router.invoke(f"""
@@ -64,13 +96,22 @@ Return valid JSON like {{"route":"kb"}}.
 """)
     return {"source_used": decision.route, "trace": add_trace(state, f"Router → {decision.route.upper()}")}
 
+# Conditional edge: the return value is the NAME of the next node to run.
 def route_after_router(state: AgentState) -> Literal["retrieve_kb", "direct_answer"]:
     return "retrieve_kb" if state["source_used"] == "kb" else "direct_answer"
 
+# ---------------------------------------------------------------------------
+# Step 2: RETRIEVE. Similarity search in Pinecone (top_k chunks, default 4).
+# Uses current_query, which may be a rewritten version on a retry.
+# ---------------------------------------------------------------------------
 def retrieve_kb(state: AgentState):
     docs = get_retriever().invoke(state["current_query"])
     return {"kb_docs": docs, "trace": add_trace(state, f"Private KB retrieval → {len(docs)} chunks")}
 
+# ---------------------------------------------------------------------------
+# Step 3: GRADE KB. "LLM as a judge": can these chunks really answer the
+# question? This is what stops the bot from answering from irrelevant text.
+# ---------------------------------------------------------------------------
 def grade_kb(state: AgentState):
     grader = llm().with_structured_output(EvidenceGrade, method="json_mode")
     context = "\n\n".join(f"Source: {d.metadata.get('source','unknown')}\n{d.page_content}" for d in state["kb_docs"])
@@ -83,9 +124,15 @@ Otherwise return weak. JSON: {{"grade":"good"}} or {{"grade":"weak"}}.
 """)
     return {"kb_grade": grade.grade, "trace": add_trace(state, f"KB evidence grade → {grade.grade.upper()}")}
 
+# Good KB evidence -> answer from KB. Weak -> fall back to the web.
 def after_kb(state: AgentState) -> Literal["generate_from_kb", "search_web"]:
     return "generate_from_kb" if state["kb_grade"] == "good" else "search_web"
 
+# ---------------------------------------------------------------------------
+# Step 4: WEB SEARCH. Only reached when the private KB was not good enough.
+# Flattens Tavily's results into one text block for the grader/answerer and
+# collects title + URL pairs as citations.
+# ---------------------------------------------------------------------------
 def search_web(state: AgentState):
     result = web_search_tool().invoke({"query": state["current_query"]})
     lines, citations = [], []
@@ -97,6 +144,7 @@ def search_web(state: AgentState):
             lines.append(f"Title: {title}\nURL: {url}\nContent: {content}")
             citations.append({"title": title or url, "url": url, "type": "web"})
     else:
+        # Fallback if Tavily returns plain text instead of a dict.
         lines.append(str(result))
     return {
         "web_results": "\n\n".join(lines),
@@ -105,6 +153,7 @@ def search_web(state: AgentState):
         "trace": add_trace(state, "Web fallback → Tavily search"),
     }
 
+# Step 5: GRADE WEB. Same "LLM as a judge" check, applied to the web results.
 def grade_web(state: AgentState):
     grader = llm().with_structured_output(EvidenceGrade, method="json_mode")
     grade = grader.invoke(f"""
@@ -115,6 +164,8 @@ Return valid JSON like {{"grade":"good"}}.
 """)
     return {"web_grade": grade.grade, "trace": add_trace(state, f"Web evidence grade → {grade.grade.upper()}")}
 
+# Good web evidence -> answer from web. Weak -> rewrite and retry if allowed,
+# otherwise give up. max_retries (default 1) prevents an endless loop.
 def after_web(state: AgentState) -> Literal["generate_from_web", "rewrite_query", "insufficient"]:
     if state["web_grade"] == "good":
         return "generate_from_web"
@@ -122,6 +173,10 @@ def after_web(state: AgentState) -> Literal["generate_from_web", "rewrite_query"
         return "rewrite_query"
     return "insufficient"
 
+# ---------------------------------------------------------------------------
+# Step 6: REWRITE. Ask the LLM for a better search query (more technical
+# keywords, same intent), count the retry, and loop back to retrieve_kb.
+# ---------------------------------------------------------------------------
 def rewrite_query(state: AgentState):
     rewritten = llm().invoke(f"""
 Rewrite this IT support question for better private knowledge retrieval and vendor web search.
@@ -134,6 +189,12 @@ Question: {state['question']}
         "trace": add_trace(state, f"Query rewrite → {rewritten}"),
     }
 
+# ---------------------------------------------------------------------------
+# ANSWER NODES. Each one ends the graph with a final answer.
+# ---------------------------------------------------------------------------
+
+# Answer strictly from the company documents ("grounded" answer) and cite
+# each distinct source file once.
 def generate_from_kb(state: AgentState):
     context = "\n\n".join(f"[Source: {d.metadata.get('source','unknown')}]\n{d.page_content}" for d in state["kb_docs"])
     answer = llm().invoke(f"""
@@ -151,6 +212,8 @@ Question: {state['question']}\n\nPrivate KB:\n{context}
             citations.append({"title": src.split("/")[-1], "url": "", "type": "private_kb"})
     return {"answer": answer, "source_used": "private_kb", "citations": citations, "trace": add_trace(state, "Answer generation → PRIVATE KB")}
 
+# Answer from web results, with a warning that it is external information.
+# (Citations were already collected in search_web.)
 def generate_from_web(state: AgentState):
     answer = llm().invoke(f"""
 You are an enterprise IT support copilot. The private company KB was insufficient.
@@ -159,10 +222,12 @@ Question: {state['question']}\n\nWeb evidence:\n{state['web_results']}
 """).content
     return {"answer": answer, "source_used": "web_search", "trace": add_trace(state, "Answer generation → WEB SEARCH")}
 
+# Greetings and small talk: reply directly, no search (saves time and cost).
 def direct_answer(state: AgentState):
     answer = llm().invoke(f"Respond briefly and naturally to: {state['question']}").content
     return {"answer": answer, "source_used": "direct", "trace": add_trace(state, "Direct response → no retrieval")}
 
+# Nothing reliable found anywhere: refuse instead of guessing (no hallucination).
 def insufficient(state: AgentState):
     return {
         "answer": "I couldn't find enough reliable evidence in the company knowledge base or external search to answer confidently. Please contact the IT help desk or provide more details.",
@@ -170,6 +235,11 @@ def insufficient(state: AgentState):
         "trace": add_trace(state, "Stopped → insufficient reliable evidence"),
     }
 
+# ---------------------------------------------------------------------------
+# GRAPH WIRING. Register every node, then connect them with edges.
+#   add_edge(a, b)                    -> always go from a to b
+#   add_conditional_edges(a, fn, map) -> run fn(state) to pick the next node
+# ---------------------------------------------------------------------------
 def build_graph():
     graph = StateGraph(AgentState)
     for name, fn in {
@@ -198,16 +268,21 @@ def build_graph():
     graph.add_conditional_edges("grade_web", after_web, {
         "generate_from_web": "generate_from_web", "rewrite_query": "rewrite_query", "insufficient": "insufficient"
     })
+    # The retry loop: a rewritten query goes back to the private KB first.
     graph.add_edge("rewrite_query", "retrieve_kb")
+    # All four answer nodes finish the run.
     graph.add_edge("generate_from_kb", END)
     graph.add_edge("generate_from_web", END)
     graph.add_edge("direct_answer", END)
     graph.add_edge("insufficient", END)
+    # compile() checks the wiring and returns a runnable graph.
     return graph.compile()
 
+# Built once when the module is imported, then reused for every request.
 agent_graph = build_graph()
 
 def ask(question: str):
+    """Entry point used by /api/chat: run the graph from a fresh state and return the final state."""
     initial: AgentState = {
         "question": question,
         "current_query": question,
